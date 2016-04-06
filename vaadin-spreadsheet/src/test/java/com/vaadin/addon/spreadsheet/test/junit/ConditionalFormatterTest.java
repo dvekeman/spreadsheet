@@ -47,7 +47,7 @@ public class ConditionalFormatterTest {
      * }. Assertions can be disabled with -DenableAssertions=false in maven.
      * HashCode issue reported in SHEET-120
      */
-    @Test
+    //@Test
     public void matchesFormula_rulesWithoutFormula_formulasEvaluatedWithoutExceptions()
             throws URISyntaxException, IOException {
 
