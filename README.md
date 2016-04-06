@@ -1,3 +1,5 @@
+# IMPORTANT: this is a custom fork, please go to: https://github.com/vaadin/spreadsheet for the official version
+
 # Vaadin Spreadsheet
 
 Vaadin Spreadsheet is a UI component add-on for Vaadin 7 which provides means to view and edit Excel spreadsheets in Vaadin applications.
