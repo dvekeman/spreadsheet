@@ -6,7 +6,7 @@
 
     <groupId>com.vaadin.addon</groupId>
     <artifactId>vaadin-spreadsheet-testbench-api</artifactId>
-    <version>1.2-SNAPSHOT</version>
+    <version>1.2.1.1</version>
     <name>Vaadin Spreadsheet Testbench API</name>
     <inceptionYear>2013</inceptionYear>
 
@@ -14,7 +14,7 @@
         <name>Vaadin Ltd</name>
         <url>https://vaadin.com</url>
     </organization>
-    
+
 
     <repositories>
         <repository>

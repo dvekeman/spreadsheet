@@ -17,10 +17,16 @@ package com.vaadin.addon.spreadsheet;
  * #L%
  */
 
-import com.vaadin.addon.spreadsheet.Spreadsheet.CellValueChangeEvent;
-import com.vaadin.addon.spreadsheet.Spreadsheet.ProtectedEditEvent;
-import com.vaadin.addon.spreadsheet.client.SpreadsheetServerRpc;
-import com.vaadin.addon.spreadsheet.command.CellValueCommand;
+import java.math.BigDecimal;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.LinkedList;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.StringTokenizer;
+
 import org.apache.poi.ss.usermodel.Cell;
 import org.apache.poi.ss.usermodel.CreationHelper;
 import org.apache.poi.ss.usermodel.RichTextString;
@@ -30,14 +36,10 @@ import org.apache.poi.ss.usermodel.Workbook;
 import org.apache.poi.ss.util.CellRangeAddress;
 import org.apache.poi.ss.util.CellReference;
 
-import java.util.ArrayList;
-import java.util.HashMap;
-import java.util.HashSet;
-import java.util.LinkedList;
-import java.util.List;
-import java.util.Map;
-import java.util.Set;
-import java.util.StringTokenizer;
+import com.vaadin.addon.spreadsheet.Spreadsheet.CellValueChangeEvent;
+import com.vaadin.addon.spreadsheet.Spreadsheet.ProtectedEditEvent;
+import com.vaadin.addon.spreadsheet.client.SpreadsheetServerRpc;
+import com.vaadin.addon.spreadsheet.command.CellValueCommand;
 
 /**
  * Implementation of the Spreadsheet Server RPC interface.
@@ -53,13 +55,13 @@ public class SpreadsheetHandlerImpl implements SpreadsheetServerRpc {
 
     @Override
     public void onSheetScroll(int firstRow, int firstColumn, int lastRow,
-            int lastColumn) {
+                              int lastColumn) {
         spreadsheet.onSheetScroll(firstRow, firstColumn, lastRow, lastColumn);
     }
 
     @Override
     public void cellSelected(int row, int column,
-            boolean discardOldRangeSelection) {
+                             boolean discardOldRangeSelection) {
         spreadsheet.getCellSelectionManager().onCellSelected(row, column,
                 discardOldRangeSelection);
     }
@@ -79,7 +81,7 @@ public class SpreadsheetHandlerImpl implements SpreadsheetServerRpc {
     /* */
     @Override
     public void cellRangePainted(int selectedCellRow, int selectedCellColumn,
-            int row1, int col1, int row2, int col2) {
+                                 int row1, int col1, int row2, int col2) {
         spreadsheet.getCellSelectionManager().onCellRangePainted(
                 selectedCellRow, selectedCellColumn, row1, col1, row2, col2);
     }
@@ -92,7 +94,7 @@ public class SpreadsheetHandlerImpl implements SpreadsheetServerRpc {
 
     @Override
     public void cellsAddedToRangeSelection(int row1, int col1, int row2,
-            int col2) {
+                                           int col2) {
         spreadsheet.getCellSelectionManager().onCellsAddedToRangeSelection(
                 row1, col1, row2, col2);
     }
@@ -199,13 +201,13 @@ public class SpreadsheetHandlerImpl implements SpreadsheetServerRpc {
 
     @Override
     public void rowsResized(Map<Integer, Float> newRowSizes, int row1,
-            int col1, int row2, int col2) {
+                            int col1, int row2, int col2) {
         spreadsheet.onRowResized(newRowSizes, row1, col1, row2, col2);
     }
 
     @Override
     public void columnResized(Map<Integer, Integer> newColumnSizes, int row1,
-            int col1, int row2, int col2) {
+                              int col1, int row2, int col2) {
         spreadsheet.onColumnResized(newColumnSizes, row1, col1, row2, col2);
     }
 
@@ -287,6 +289,21 @@ public class SpreadsheetHandlerImpl implements SpreadsheetServerRpc {
                 rowIndex + pasteHeight - 1, colIndex, colIndex + pasteWidth - 1);
         command.captureCellRangeValues(affectedRange);
 
+        String[][] valueMatrix = new String[pasteHeight][pasteWidth];
+        Object[][] returnMatrix = new String[pasteHeight][pasteWidth];
+        if (spreadsheet.getLocaleHandler() != null) {
+            for (int i = 0; i < pasteHeight; i++) {
+                String line = lines[i];
+                String[] tokens = splitOnTab(line);
+                for (int j = 0; j < pasteWidth; j++) {
+                    if (j < tokens.length) {
+                        valueMatrix[i][j] = tokens[j];
+                    }
+                }
+            }
+            returnMatrix = spreadsheet.getLocaleHandler().convertValues(valueMatrix, colIndex);
+        }
+
         for (int i = 0; i < pasteHeight; i++) {
             String line = lines[i];
             Row row = activesheet.getRow(rowIndex + i);
@@ -300,14 +317,25 @@ public class SpreadsheetHandlerImpl implements SpreadsheetServerRpc {
                     cell = row.createCell(colIndex + j);
                 }
                 if (j < tokens.length) {
-                    String cellContent = tokens[j];
-                    Double numVal = SpreadsheetUtil.parseNumber(cell,
-                            cellContent, spreadsheet.getLocale());
-                    if (numVal != null) {
-                        cell.setCellType(Cell.CELL_TYPE_NUMERIC);
-                        cell.setCellValue(numVal);
+                    String cellContent;
+                    if (valueMatrix[0][0]==null) {
+                        cellContent = tokens[j];
+                        Double numVal = SpreadsheetUtil.parseNumber(cell,
+                                cellContent, spreadsheet.getLocale());
+                        if (numVal != null) {
+                            cell.setCellType(Cell.CELL_TYPE_NUMERIC);
+                            cell.setCellValue(numVal);
+                        } else {
+                            cell.setCellValue(cellContent);
+                        }
                     } else {
-                        cell.setCellValue(cellContent);
+                        if (returnMatrix[i][j] instanceof BigDecimal) {
+                            BigDecimal numVal = (BigDecimal) returnMatrix[i][j];
+                            cell.setCellType(Cell.CELL_TYPE_NUMERIC);
+                            cell.setCellValue(numVal.doubleValue());
+                        } else {
+                            cell.setCellValue(returnMatrix[i][j].toString());
+                        }
                     }
                 } else {
                     cell.setCellType(Cell.CELL_TYPE_BLANK);
@@ -350,7 +378,7 @@ public class SpreadsheetHandlerImpl implements SpreadsheetServerRpc {
      * E.g.<br/>
      * "1\t2" - {"1","2"}<br/>
      * "\t\t" - {"","",""}<br/>
-     * 
+     *
      * @param line
      *            input
      * @return output string parts split at tabs
@@ -460,7 +488,7 @@ public class SpreadsheetHandlerImpl implements SpreadsheetServerRpc {
 
     @Override
     public void setGroupingCollapsed(boolean isCols, int colIndex,
-            boolean collapsed) {
+                                     boolean collapsed) {
         spreadsheet.setGroupingCollapsed(isCols, colIndex, collapsed);
     }
 
