@@ -17,7 +17,6 @@ package com.vaadin.addon.spreadsheet;
  * #L%
  */
 
-import java.io.ByteArrayInputStream;
 import java.io.File;
 import java.io.FileNotFoundException;
 import java.io.IOException;
@@ -31,7 +30,6 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Calendar;
 import java.util.Collection;
-import java.util.Collections;
 import java.util.Date;
 import java.util.EventObject;
 import java.util.HashMap;
@@ -41,7 +39,6 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Map.Entry;
-import java.util.NoSuchElementException;
 import java.util.Set;
 import java.util.logging.Level;
 import java.util.logging.Logger;
@@ -73,10 +70,11 @@ import org.openxmlformats.schemas.spreadsheetml.x2006.main.CTCol;
 import org.openxmlformats.schemas.spreadsheetml.x2006.main.CTCols;
 import org.openxmlformats.schemas.spreadsheetml.x2006.main.CTWorksheet;
 
+import com.vaadin.addon.spreadsheet.SheetOverlayWrapper.OverlayChangeListener;
 import com.vaadin.addon.spreadsheet.action.SpreadsheetDefaultActionHandler;
-import com.vaadin.addon.spreadsheet.client.ImageInfo;
 import com.vaadin.addon.spreadsheet.client.MergedRegion;
 import com.vaadin.addon.spreadsheet.client.MergedRegionUtil.MergedRegionContainer;
+import com.vaadin.addon.spreadsheet.client.OverlayInfo;
 import com.vaadin.addon.spreadsheet.client.SpreadsheetClientRpc;
 import com.vaadin.addon.spreadsheet.command.SizeChangeCommand;
 import com.vaadin.addon.spreadsheet.command.SizeChangeCommand.Type;
@@ -84,8 +82,6 @@ import com.vaadin.addon.spreadsheet.shared.SpreadsheetState;
 import com.vaadin.event.Action;
 import com.vaadin.event.Action.Handler;
 import com.vaadin.server.Resource;
-import com.vaadin.server.StreamResource;
-import com.vaadin.server.StreamResource.StreamSource;
 import com.vaadin.ui.AbstractComponent;
 import com.vaadin.ui.Component;
 import com.vaadin.ui.Component.Focusable;
@@ -164,6 +160,77 @@ public class Spreadsheet extends AbstractComponent implements HasComponents,
     }
 
     /**
+     * An interface for handling cell deletion from user input.
+     */
+    public interface CellDeletionHandler extends Serializable {
+
+        /**
+         * Called if a cell value has been deleted by the user. Use
+         * {@link Spreadsheet#setCellDeletionHandler(CellDeletionHandler)} to
+         * enable it for the spreadsheet.
+         *
+         * @param cell
+         *            The cell that has been deleted
+         * @param sheet
+         *            The sheet the cell belongs to, the currently active sheet
+         * @param colIndex
+         *            Cell column index, 0-based
+         * @param rowIndex
+         *            Cell row index, 0-based
+         * @param formulaEvaluator
+         *            The {@link FormulaEvaluator} for this sheet
+         * @param formatter
+         *            The {@link DataFormatter} for this workbook
+         * @return <code>true</code> if component default deletion should still
+         *         be done, <code>false</code> if not
+         */
+        public boolean cellDeleted(Cell cell, Sheet sheet, int colIndex,
+                int rowIndex, FormulaEvaluator formulaEvaluator,
+                DataFormatter formatter);
+
+        /**
+         * Called if individually selected cell values have been deleted by the
+         * user. Use
+         * {@link Spreadsheet#setCellDeletionHandler(CellDeletionHandler)} to
+         * enable it for the spreadsheet.
+         *
+         * @param individualSelectedCells
+         *            The cells that have been deleted
+         * @param sheet
+         *            The sheet the cells belong to, the currently active sheet
+         * @param formulaEvaluator
+         *            The {@link FormulaEvaluator} for this sheet
+         * @param formatter
+         *            The {@link DataFormatter} for this workbook
+         * @return <code>true</code> if component default deletion should still
+         *         be done, <code>false</code> if not
+         */
+        public boolean individualSelectedCellsDeleted(
+                List<CellReference> individualSelectedCells, Sheet sheet,
+                FormulaEvaluator formulaEvaluator, DataFormatter formatter);
+
+        /**
+         * Called if a cell range has been deleted by the user. Use
+         * {@link Spreadsheet#setCellDeletionHandler(CellDeletionHandler)} to
+         * enable it for the spreadsheet.
+         *
+         * @param cellRangeAddresses
+         *            The range of cells that has been deleted
+         * @param sheet
+         *            The sheet the cells belongs to, the currently active sheet
+         * @param formulaEvaluator
+         *            The {@link FormulaEvaluator} for this sheet
+         * @param formatter
+         *            The {@link DataFormatter} for this workbook
+         * @return <code>true</code> if component default deletion should still
+         *         be done, <code>false</code> if not
+         */
+        public boolean cellRangeDeleted(
+                List<CellRangeAddress> cellRangeAddresses, Sheet sheet,
+                FormulaEvaluator formulaEvaluator, DataFormatter formatter);
+    }
+
+    /**
      * An interface for handling clicks on cells that contain a hyperlink.
      * <p>
      * Implement this interface and use
@@ -201,11 +268,16 @@ public class Spreadsheet extends AbstractComponent implements HasComponents,
             this);
     private ConditionalFormatter conditionalFormatter;
 
+    /** The first visible row in the scroll area **/
     private int firstRow;
+    /** The last visible row in the scroll area **/
     private int lastRow;
+    /** The first visible column in the scroll area **/
     private int firstColumn;
+    /** The last visible column in the scroll area **/
     private int lastColumn;
 
+    private boolean chartsEnabled = true;
     /**
      * This is used for making sure the cells are sent to client side in when
      * the next cell data request comes. This is triggered when the client side
@@ -231,14 +303,16 @@ public class Spreadsheet extends AbstractComponent implements HasComponents,
     /** are tables for currently active sheet loaded */
     private boolean tablesLoaded;
 
-    /** image sizes need to be recalculated on column/row resizing s */
+    private SheetState sheetState = new SheetState(this);
+
+    /** image sizes need to be recalculated on column/row resizing */
     private boolean reloadImageSizesFromPOI;
 
     private String defaultPercentageFormat = "0.00%";
 
     protected String initialSheetSelection = null;
 
-    private HashSet<Component> customComponents;
+    private Set<Component> customComponents = new HashSet<Component>();
 
     private Map<CellReference, PopupButton> sheetPopupButtons = new HashMap<CellReference, PopupButton>();
 
@@ -247,7 +321,9 @@ public class Spreadsheet extends AbstractComponent implements HasComponents,
     /**
      * Set of images contained in the currently active sheet.
      */
-    protected HashSet<SheetImageWrapper> sheetImages;
+    private HashSet<SheetOverlayWrapper> sheetOverlays;
+
+    private Set<Component> overlayComponents = new HashSet<Component>();
 
     private HashSet<SpreadsheetTable> tables;
 
@@ -376,7 +452,7 @@ public class Spreadsheet extends AbstractComponent implements HasComponents,
     }
 
     private void init() {
-        sheetImages = new HashSet<SheetImageWrapper>();
+        sheetOverlays = new HashSet<SheetOverlayWrapper>();
         tables = new HashSet<SpreadsheetTable>();
         registerRpc(new SpreadsheetHandlerImpl(this));
         setSizeFull(); // Default to full size
@@ -456,6 +532,30 @@ public class Spreadsheet extends AbstractComponent implements HasComponents,
      */
     public CellValueHandler getCellValueHandler() {
         return getCellValueManager().getCustomCellValueHandler();
+    }
+
+    /**
+     * Sets the {@link CellDeletionHandler} for this component (not
+     * workbook/sheet specific). It is called when a cell has been deleted by
+     * the user.
+     * 
+     * @param customCellDeletionHandler
+     *            New handler or <code>null</code> if none should be used
+     */
+    public void setCellDeletionHandler(
+            CellDeletionHandler customCellDeletionHandler) {
+        getCellValueManager().setCustomCellDeletionHandler(
+                customCellDeletionHandler);
+    }
+
+    /**
+     * See {@link CellDeletionHandler}.
+     * 
+     * @return the current {@link CellDeletionHandler} for this component or
+     *         <code>null</code> if none has been set
+     */
+    public CellDeletionHandler getCellDeletionHandler() {
+        return getCellValueManager().getCustomCellDeletionHandler();
     }
 
     /**
@@ -595,6 +695,28 @@ public class Spreadsheet extends AbstractComponent implements HasComponents,
      */
     public int getLastFrozenColumn() {
         return getState(false).horizontalSplitPosition;
+    }
+
+    /**
+     * Returns true if embedded charts are displayed
+     * 
+     * @see #setChartsEnabled(boolean)
+     * @return
+     */
+    public boolean isChartsEnabled() {
+        return chartsEnabled;
+    }
+
+    /**
+     * Use this method to define whether embedded charts should be displayed in
+     * the spreadsheet or not.
+     * 
+     * @param chartsEnabled
+     */
+    public void setChartsEnabled(boolean chartsEnabled) {
+        this.chartsEnabled = chartsEnabled;
+        clearSheetOverlays();
+        loadOrUpdateOverlays();
     }
 
     /**
@@ -827,7 +949,8 @@ public class Spreadsheet extends AbstractComponent implements HasComponents,
             throws IllegalArgumentException {
         // POI allows user to hide all sheets ...
         if (hidden != 0
-                && SpreadsheetUtil.getNumberOfVisibleSheets(workbook) == 1) {
+                && SpreadsheetUtil.getNumberOfVisibleSheets(workbook) == 1
+                && !workbook.isSheetHidden(sheetPOIIndex)) {
             throw new IllegalArgumentException(
                     "At least one sheet should be always visible.");
         }
@@ -1270,7 +1393,25 @@ public class Spreadsheet extends AbstractComponent implements HasComponents,
      * @return The cell at the given coordinates, or null if not defined
      */
     public Cell getCell(int row, int col) {
-        Row r = workbook.getSheetAt(workbook.getActiveSheetIndex()).getRow(row);
+        Sheet sheet = workbook.getSheetAt(workbook.getActiveSheetIndex());
+        return getCell(row, col, sheet);
+    }
+
+    /**
+     * Returns the Cell at the given coordinates. If the cell is updated in
+     * outside code, call {@link #refreshCells(Cell...)} AFTER ALL UPDATES
+     * (value, type, formatting or style) to mark the cell as "dirty".
+     *
+     * @param row
+     *            Row index of the cell to return, 0-based
+     * @param col
+     *            Column index of the cell to return, 0-based
+     * @param sheet
+     *            Sheet of the cell
+     * @return The cell at the given coordinates, or null if not defined
+     */
+    public Cell getCell(int row, int col, Sheet sheet) {
+        Row r = sheet.getRow(row);
         if (r != null) {
             return r.getCell(col);
         } else {
@@ -1291,6 +1432,23 @@ public class Spreadsheet extends AbstractComponent implements HasComponents,
     public Cell getCell(CellReference cellReference) {
         return cellReference == null ? null : getCell(cellReference.getRow(),
                 cellReference.getCol());
+    }
+
+    /**
+     * Returns the Cell corresponding to the given reference. If the cell is
+     * updated in outside code, call {@link #refreshCells(Cell...)} AFTER ALL
+     * UPDATES (value, type, formatting or style) to mark the cell as "dirty".
+     *
+     * @param cellReference
+     *            Reference to the cell to return
+     * @param sheet
+     *            Sheet of the cell
+     * @return The cell corresponding to the given reference, or null if not
+     *         defined
+     */
+    public Cell getCell(CellReference cellReference, Sheet sheet) {
+        return cellReference == null ? null : getCell(cellReference.getRow(),
+                cellReference.getCol(), sheet);
     }
 
     /**
@@ -1669,9 +1827,10 @@ public class Spreadsheet extends AbstractComponent implements HasComponents,
         getCellValueManager().clearCacheForColumn(columnIndex + 1);
         getCellValueManager().loadCellData(firstRow, columnIndex + 1, lastRow,
                 columnIndex + 1);
-        if (hasSheetImages()) {
+
+        if (hasSheetOverlays()) {
             reloadImageSizesFromPOI = true;
-            loadImages();
+            loadOrUpdateOverlays();
         }
     }
 
@@ -1752,7 +1911,8 @@ public class Spreadsheet extends AbstractComponent implements HasComponents,
                 }
             }
         }
-        if (hasSheetImages()) {
+
+        if (hasSheetOverlays()) {
             reloadImageSizesFromPOI = true;
         }
         // need to shift the cell styles, clear and update
@@ -1796,7 +1956,6 @@ public class Spreadsheet extends AbstractComponent implements HasComponents,
         }
         rowsMoved(firstAffectedRow, lastAffectedRow, n);
 
-
         for (Cell cell : cellsToUpdate) {
             styler.cellStyleUpdated(cell, false);
             markCellAsUpdated(cell, false);
@@ -1819,25 +1978,30 @@ public class Spreadsheet extends AbstractComponent implements HasComponents,
         }
     }
 
-    private boolean hasSheetImages() {
-        return sheetImages != null && sheetImages.size() > 0;
+    private boolean hasSheetOverlays() {
+        return sheetOverlays != null && sheetOverlays.size() > 0;
     }
 
     /**
-     * Called when number of rows has moved. Spreadsheet needs to update its internal state.
+     * Called when number of rows has moved. Spreadsheet needs to update its
+     * internal state.
      *
-     * Note: If n is negative it would mean the rows has moved up. Positive value
-     * indicates that new rows are moved below.
+     * Note: If n is negative it would mean the rows has moved up. Positive
+     * value indicates that new rows are moved below.
      *
-     * @param first the first row that has changed, 0-based
-     * @param last the last row that has changed, 0-based
-     * @param n the amount of lines that rows has been moved
+     * @param first
+     *            the first row that has changed, 0-based
+     * @param last
+     *            the last row that has changed, 0-based
+     * @param n
+     *            the amount of lines that rows has been moved
      */
     private void rowsMoved(int first, int last, int n) {
         // Merged regions
-        if(n < 0) {
-            // Remove merged cells from deleted rows. POI will handle the other updated values.
-            for(int row = (first+n); row <= first; ++row) {
+        if (n < 0) {
+            // Remove merged cells from deleted rows. POI will handle the other
+            // updated values.
+            for (int row = (first + n); row <= first; ++row) {
                 Sheet sheet = getActiveSheet();
                 for (int i = 0; i < sheet.getNumMergedRegions(); i++) {
                     CellRangeAddress mergedRegion = sheet.getMergedRegion(i);
@@ -1849,17 +2013,18 @@ public class Spreadsheet extends AbstractComponent implements HasComponents,
         }
 
         // PopupButtons
-        if(!sheetPopupButtons.isEmpty()) {
+        if (!sheetPopupButtons.isEmpty()) {
             Map<CellReference, PopupButton> updated = new HashMap<CellReference, PopupButton>();
 
-            for (Entry<CellReference, PopupButton> entry : sheetPopupButtons.entrySet()) {
+            for (Entry<CellReference, PopupButton> entry : sheetPopupButtons
+                    .entrySet()) {
                 CellReference cell = entry.getKey();
                 PopupButton pbutton = entry.getValue();
                 unRegisterPopupButton(pbutton);
                 int row = cell.getRow();
                 if (rowWasRemoved(row, first, n)) {
                     // do nothing -> will be removed
-                } else if (numberOfRowsAboveWasChanged(row, last, first, n)) {
+                } else if (numberOfRowsAboveWasChanged(row, last, first)) {
                     int newRow = cell.getRow() + n;
                     int col = cell.getCol();
                     CellReference newCell = new CellReference(newRow, col);
@@ -1877,14 +2042,15 @@ public class Spreadsheet extends AbstractComponent implements HasComponents,
         HashSet<String> original = invalidFormulas.get(activeSheetIndex);
         if (original != null) {
             HashSet<String> updated = new HashSet<String>();
-            for(String key : original) {
+            for (String key : original) {
                 int row = SpreadsheetUtil.getRowFromKey(key) - 1;
                 int col = SpreadsheetUtil.getColumnIndexFromKey(key) - 1;
-                if(rowWasRemoved(row, first, n)) {
+                if (rowWasRemoved(row, first, n)) {
                     // do nothing -> will be removed
-                } else if(numberOfRowsAboveWasChanged(row, last, first, n)) {
-                    // the number of the rows above has changed -> update the row index
-                    updated.add(SpreadsheetUtil.toKey(col+1,row+n+1));
+                } else if (numberOfRowsAboveWasChanged(row, last, first)) {
+                    // the number of the rows above has changed -> update the
+                    // row index
+                    updated.add(SpreadsheetUtil.toKey(col + 1, row + n + 1));
                 } else {
                     updated.add(key);
                 }
@@ -1894,7 +2060,7 @@ public class Spreadsheet extends AbstractComponent implements HasComponents,
         }
     }
 
-    private boolean numberOfRowsAboveWasChanged(int row, int last, int first, int n) {
+    private boolean numberOfRowsAboveWasChanged(int row, int last, int first) {
         return first <= row && row <= last;
     }
 
@@ -1978,7 +2144,8 @@ public class Spreadsheet extends AbstractComponent implements HasComponents,
         }
         updateMergedRegions();
         valueManager.updateDeletedRowsInClientCache(startRow + 1, endRow + 1);
-        if (hasSheetImages()) {
+
+        if (hasSheetOverlays()) {
             reloadImageSizesFromPOI = true;
         }
         updateMarkedCells();
@@ -2197,9 +2364,10 @@ public class Spreadsheet extends AbstractComponent implements HasComponents,
             getCellValueManager().loadCellData(firstRow, columnIndex + 1,
                     lastRow, columnIndex + 1);
         }
-        if (hasSheetImages()) {
+
+        if (hasSheetOverlays()) {
             reloadImageSizesFromPOI = true;
-            loadImages();
+            loadOrUpdateOverlays();
         }
     }
 
@@ -2239,9 +2407,10 @@ public class Spreadsheet extends AbstractComponent implements HasComponents,
                     .indexOf(rowIndex + 1));
             getState().rowH[rowIndex] = row.getHeightInPoints();
         }
-        if (hasSheetImages()) {
+
+        if (hasSheetOverlays()) {
             reloadImageSizesFromPOI = true;
-            loadImages();
+            loadOrUpdateOverlays();
         }
     }
 
@@ -2448,10 +2617,15 @@ public class Spreadsheet extends AbstractComponent implements HasComponents,
         historyManager.clear();
         invalidFormulas.clear();
         sheetPopupButtons.clear();
-        for (SheetImageWrapper image : sheetImages) {
-            setResource(image.getResourceKey(), null);
+        sheetState.clear();
+        clearSheetOverlays();
+    }
+
+    private void clearSheetOverlays() {
+        for (SheetOverlayWrapper image : sheetOverlays) {
+            removeOverlayData(image);
         }
-        sheetImages.clear();
+        sheetOverlays.clear();
     }
 
     void setInternalWorkbook(Workbook workbook) {
@@ -2508,10 +2682,7 @@ public class Spreadsheet extends AbstractComponent implements HasComponents,
         valueManager.clearCachedContent();
 
         firstColumn = lastColumn = firstRow = lastRow = -1;
-        for (SheetImageWrapper image : sheetImages) {
-            setResource(image.getResourceKey(), null);
-        }
-        sheetImages.clear();
+        clearSheetOverlays();
         topLeftCellCommentsLoaded = false;
         topLeftCellHyperlinksLoaded = false;
 
@@ -2522,18 +2693,18 @@ public class Spreadsheet extends AbstractComponent implements HasComponents,
         getState().cellKeysToEditorIdMap = null;
         getState().hyperlinksTooltips = null;
         getState().componentIDtoCellKeysMap = null;
-        getState().resourceKeyToImage = null;
+        getState().overlays = null;
         getState().mergedRegions = null;
         getState().cellComments = null;
         getState().cellCommentAuthors = null;
         getState().visibleCellComments = null;
         getState().invalidFormulaCells = null;
-        if (customComponents != null && !customComponents.isEmpty()) {
-            for (Component c : customComponents) {
-                unRegisterCustomComponent(c);
-            }
-            customComponents.clear();
+
+        for (Component c : customComponents) {
+            unRegisterCustomComponent(c);
         }
+        customComponents.clear();
+
         if (attachedPopupButtons != null && !attachedPopupButtons.isEmpty()) {
             for (PopupButton sf : new ArrayList<PopupButton>(
                     attachedPopupButtons)) {
@@ -2548,7 +2719,7 @@ public class Spreadsheet extends AbstractComponent implements HasComponents,
 
         reloadSheetNames();
         updateMergedRegions();
-
+        styler.reloadActiveSheetColumnRowStyles();
         getState().displayGridlines = getActiveSheet().isDisplayGridlines();
         getState().displayRowColHeadings = getActiveSheet()
                 .isDisplayRowColHeadings();
@@ -2677,8 +2848,22 @@ public class Spreadsheet extends AbstractComponent implements HasComponents,
      * @return true if the cell is locked, false otherwise
      */
     public boolean isCellLocked(Cell cell) {
-        return isActiveSheetProtected()
-                && (cell == null || cell.getCellStyle().getLocked());
+        if (isActiveSheetProtected()) {
+            if (cell != null) {
+                if (cell.getCellStyle().getIndex() != 0) {
+                    return cell.getCellStyle().getLocked();
+                } else {
+                    return getState(false).lockedColumnIndexes.contains(cell
+                            .getColumnIndex() + 1)
+                            && getState(false).lockedRowIndexes.contains(cell
+                                    .getRowIndex() + 1);
+                }
+            } else {
+                return true;
+            }
+        } else {
+            return false;
+        }
     }
 
     /**
@@ -2702,7 +2887,12 @@ public class Spreadsheet extends AbstractComponent implements HasComponents,
             reload = false;
             getState().reload = true;
             if (initialSheetSelection == null) {
-                initialSheetSelection = "A1";
+                if (sheetState.getSelectedCellsOnSheet(getActiveSheet()) == null) {
+                    initialSheetSelection = "A1";
+                } else {
+                    initialSheetSelection = sheetState
+                            .getSelectedCellsOnSheet(getActiveSheet());
+                }
             }
         } else {
             getState().reload = false;
@@ -2770,7 +2960,7 @@ public class Spreadsheet extends AbstractComponent implements HasComponents,
         // etc. always
         loadHyperLinks();
         loadCellComments();
-        loadImages();
+        loadOrUpdateOverlays();
         loadPopupButtons();
         // custom components not updated here on purpose
 
@@ -2795,7 +2985,7 @@ public class Spreadsheet extends AbstractComponent implements HasComponents,
         loadCustomComponents();
         loadHyperLinks();
         loadCellComments();
-        loadImages();
+        loadOrUpdateOverlays();
         loadTables();
         loadPopupButtons();
         valueManager.loadCellData(firstRow, firstColumn, lastRow, lastColumn);
@@ -2825,7 +3015,8 @@ public class Spreadsheet extends AbstractComponent implements HasComponents,
             float height = entry.getValue();
             setRowHeight(index - 1, height);
         }
-        if (hasSheetImages()) {
+
+        if (hasSheetOverlays()) {
             reloadImageSizesFromPOI = true;
         }
         loadCells(row1, col1, row2, col2);
@@ -2871,7 +3062,8 @@ public class Spreadsheet extends AbstractComponent implements HasComponents,
             int width = entry.getValue();
             setColumnWidth(index - 1, width);
         }
-        if (hasSheetImages()) {
+
+        if (hasSheetOverlays()) {
             reloadImageSizesFromPOI = true;
         }
         loadCells(row1, col1, row2, col2);
@@ -2978,101 +3170,190 @@ public class Spreadsheet extends AbstractComponent implements HasComponents,
         }
     }
 
-    private void loadImages() {
-        if (sheetImages.isEmpty()) {
-            getState().resourceKeyToImage = null;
-        } else {
-            if (getState(false).resourceKeyToImage == null) {
-                getState(false).resourceKeyToImage = new HashMap<String, ImageInfo>();
-            }
+    private void loadOrUpdateOverlays() {
+        // Fixes the issue of overlays being lost when creating or removing
+        // frozen rows/columns. More like a kludge, a real solution is yet to be
+        // found.
+        if (!hasSheetOverlays()) {
+            SpreadsheetFactory.loadSheetOverlays(this);
+        }
+
+        if (hasSheetOverlays()) {
             // reload images from POI because row / column sizes have changed
             // currently doesn't effect anything because POI doesn't update the
             // image anchor data after resizing
             if (reloadImageSizesFromPOI) {
-                for (SheetImageWrapper image : sheetImages) {
-                    if (image.isVisible()) {
-                        getState().resourceKeyToImage.remove(image
-                                .getResourceKey());
-                        setResource(image.getResourceKey(), null);
-                    }
-                }
-                sheetImages.clear();
-                SpreadsheetFactory.loadSheetImages(this);
+                clearSheetOverlays();
+                SpreadsheetFactory.loadSheetOverlays(this);
+                reloadImageSizesFromPOI = false;
             }
-            for (final SheetImageWrapper image : sheetImages) {
-                if (isImageVisible(image)) {
-                    if (!getState(false).resourceKeyToImage.containsKey(image
-                            .getResourceKey())) {
-                        ImageInfo imageInfo = new ImageInfo();
-                        generateImageInfo(image, imageInfo);
-                        getState().resourceKeyToImage.put(
-                                image.getResourceKey(), imageInfo);
-                        if (image.getResource() == null) {
-                            StreamSource streamSource = new StreamSource() {
 
-                                @Override
-                                public InputStream getStream() {
-                                    return new ByteArrayInputStream(
-                                            image.getData());
-                                }
-                            };
-                            StreamResource resource = new StreamResource(
-                                    streamSource, image.getResourceKey());
-                            resource.setMIMEType(image.getMIMEType());
-                            setResource(image.getResourceKey(), resource);
-                            image.setResource(resource);
-                        }
-                        image.setVisible(true);
-                    } else {
-                        generateImageInfo(image,
-                                getState(false).resourceKeyToImage.get(image
-                                        .getResourceKey()));
+            for (final SheetOverlayWrapper overlay : sheetOverlays) {
+                if (isOverlayVisible(overlay)) {
+                    addOverlayData(overlay);
+                    overlay.setVisible(true);
+                } else {
+                    // was visible but went out of visibility
+                    if (overlay.isVisible()) {
+                        removeOverlayData(overlay);
+                        overlay.setVisible(false);
                     }
-                } else if (image.isVisible()) {
-                    getState().resourceKeyToImage
-                            .remove(image.getResourceKey());
-                    image.setVisible(false);
                 }
             }
         }
-        reloadImageSizesFromPOI = false;
     }
 
-    private boolean isImageVisible(SheetImageWrapper image) {
+    /**
+     * Adds necessary data to display the overlay in the current view.
+     */
+    private void addOverlayData(final SheetOverlayWrapper overlay) {
+        if (overlay.getComponent(true) != null) {
+            registerCustomComponent(overlay.getComponent(true));
+            overlayComponents.add(overlay.getComponent(true));
+        }
+
+        if (overlay.getId() != null && overlay.getResource() != null) {
+            setResource(overlay.getId(), overlay.getResource());
+        }
+
+        if (overlay.getId() != null) {
+            if (getState().overlays == null) {
+                getState().overlays = new HashMap<String, OverlayInfo>();
+            }
+
+            getState().overlays
+                    .put(overlay.getId(), createOverlayInfo(overlay));
+
+            overlay.setOverlayChangeListener(new OverlayChangeListener() {
+                @Override
+                public void overlayChanged() {
+                    loadOrUpdateOverlays();
+                }
+            });
+        }
+    }
+
+    /**
+     * Undoes what addOverlayData did.
+     */
+    private void removeOverlayData(final SheetOverlayWrapper overlay) {
+        if (overlay.getId() != null) {
+            if (getState().overlays != null) {
+                getState().overlays.remove(overlay.getId());
+            }
+            setResource(overlay.getId(), null);
+        }
+
+        if (overlay.getComponent(false) != null) {
+            overlayComponents.remove(overlay.getComponent(false));
+            unRegisterCustomComponent(overlay.getComponent(false));
+        }
+    }
+
+    /**
+     * Decides if overlay is visible in the current view.
+     */
+    private boolean isOverlayVisible(SheetOverlayWrapper overlay) {
+        int col1 = overlay.getAnchor().getCol1();
+        int col2 = overlay.getAnchor().getCol2();
+        int row1 = overlay.getAnchor().getRow1();
+        int row2 = overlay.getAnchor().getRow2();
+
+        // type=2, doesn't size with cells
+        final boolean isType2 = (col2 == 0 && row2 == 0);
+
+        if (!isType2) {
+            // to ensure compatibility with grouping/hidden columns
+            if (isColumnRangeHidden(col1, col2) || isRowRangeHidden(row1, row2)) {
+                return false;
+            }
+        }
+
         int horizontalSplitPosition = getLastFrozenColumn();
         int verticalSplitPosition = getLastFrozenRow();
-        return (horizontalSplitPosition > 0 && verticalSplitPosition > 0 && image
-                .isVisible(1, 1, verticalSplitPosition, horizontalSplitPosition))
-                || (horizontalSplitPosition > 0 && image.isVisible(firstRow, 1,
-                        lastRow, horizontalSplitPosition))
-                || (verticalSplitPosition > 0 && image.isVisible(1,
-                        firstColumn, verticalSplitPosition, lastColumn))
-                || image.isVisible(firstRow, firstColumn, lastRow, lastColumn);
 
+        // the sheet is divided into four areas by vertical and horizontal split
+
+        boolean visibleInArea1 = horizontalSplitPosition > 0
+                && verticalSplitPosition > 0
+                && overlay.isVisible(1, 1, verticalSplitPosition,
+                        horizontalSplitPosition);
+
+        boolean visibleInArea2 = horizontalSplitPosition > 0
+                && overlay.isVisible(firstRow, 1, lastRow,
+                        horizontalSplitPosition);
+
+        boolean visibleInArea3 = verticalSplitPosition > 0
+                && overlay.isVisible(1, firstColumn, verticalSplitPosition,
+                        lastColumn);
+
+        boolean visibleInArea4 = overlay.isVisible(firstRow, firstColumn,
+                lastRow, lastColumn);
+
+        return visibleInArea1 || visibleInArea2 || visibleInArea3
+                || visibleInArea4;
     }
 
-    private void generateImageInfo(final SheetImageWrapper image,
-            final ImageInfo info) {
+    /**
+     * Return true if all the rows in the range are hidden (including row2).
+     */
+    private boolean isRowRangeHidden(int row1, int row2) {
+        for (int row = row1; row <= row2; row++) {
+            if (!isRowHidden(row)) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    /**
+     * Return true if all the columns in the range are hidden (including col2).
+     */
+    private boolean isColumnRangeHidden(int col1, int col2) {
+        for (int col = col1; col <= col2; col++) {
+            if (!isColumnHidden(col)) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    private OverlayInfo createOverlayInfo(SheetOverlayWrapper overlayWrapper) {
+        OverlayInfo info = new OverlayInfo(overlayWrapper.getType());
+
         Sheet sheet = getActiveSheet();
 
-        int col = image.getAnchor().getCol1();
-        while (sheet.isColumnHidden(col) && col < (getState(false).cols - 1)) {
+        int col = overlayWrapper.getAnchor().getCol1();
+        while (isColumnHidden(col)) {
             col++;
         }
-        int row = image.getAnchor().getRow1();
-        Row r = sheet.getRow(row);
-        while (r != null && r.getZeroHeight()) {
+
+        int row = overlayWrapper.getAnchor().getRow1();
+        while (isRowHidden(row)) {
             row++;
-            r = sheet.getRow(row);
         }
 
         info.col = col + 1; // 1-based
         info.row = row + 1; // 1-based
-        info.height = image.getHeight(sheet, getState(false).rowH);
-        info.width = image.getWidth(sheet, getState(false).colW,
+
+        info.height = overlayWrapper.getHeight(sheet, getState(false).rowH);
+        info.width = overlayWrapper.getWidth(sheet, getState(false).colW,
                 getState(false).defColW);
-        info.dx = image.getDx1(sheet);
-        info.dy = image.getDy1(sheet);
+
+        // FIXME: height and width can be -1, it is never handled anywhere
+
+        // if original start row/column is hidden, use 0 dy/dx
+        if (col == overlayWrapper.getAnchor().getCol1()) {
+            info.dx = overlayWrapper.getDx1(sheet);
+        }
+
+        if (row == overlayWrapper.getAnchor().getRow1()) {
+            info.dy = overlayWrapper.getDy1(sheet);
+        }
+
+        return info;
     }
 
     private void loadCellComments() {
@@ -3139,7 +3420,8 @@ public class Spreadsheet extends AbstractComponent implements HasComponents,
                 if (region == null || region.col1 == c_one_based
                         && region.row1 == row_one_based) {
                     Comment comment = sheet.getCellComment(r, c);
-                    String key = SpreadsheetUtil.toKey(c_one_based, row_one_based);
+                    String key = SpreadsheetUtil.toKey(c_one_based,
+                            row_one_based);
                     if (comment != null) {
                         // by default comments are shown when mouse is over the
                         // red
@@ -3154,10 +3436,9 @@ public class Spreadsheet extends AbstractComponent implements HasComponents,
                             getState().visibleCellComments.add(key);
                         }
                     }
-                    if(isMarkedAsInvalidFormula(c_one_based, row_one_based)) {
+                    if (isMarkedAsInvalidFormula(c_one_based, row_one_based)) {
                         getState().invalidFormulaCells.add(key);
                     }
-
 
                 } else {
                     c = region.col2 - 1;
@@ -3450,8 +3731,10 @@ public class Spreadsheet extends AbstractComponent implements HasComponents,
     public void setPopup(CellReference cellReference, PopupButton popupButton) {
         removePopupButton(cellReference);
         if (popupButton != null) {
-            popupButton.setCellReference(cellReference);
-            sheetPopupButtons.put(cellReference, popupButton);
+            CellReference newCellReference = SpreadsheetUtil
+                    .relativeToAbsolute(this, cellReference);
+            popupButton.setCellReference(newCellReference);
+            sheetPopupButtons.put(newCellReference, popupButton);
             if (isCellVisible(cellReference.getRow() + 1,
                     cellReference.getCol() + 1)) {
                 registerPopupButton(popupButton);
@@ -3476,12 +3759,15 @@ public class Spreadsheet extends AbstractComponent implements HasComponents,
     private void loadPopupButtons() {
         if (sheetPopupButtons != null) {
             for (PopupButton popupButton : sheetPopupButtons.values()) {
-                int column = popupButton.getColumn() + 1;
-                int row = popupButton.getRow() + 1;
-                if (isCellVisible(row, column)) {
-                    registerPopupButton(popupButton);
-                } else {
-                    unRegisterPopupButton(popupButton);
+                if (getActiveSheet().getSheetName().equals(
+                        popupButton.getCellReference().getSheetName())) {
+                    int column = popupButton.getColumn() + 1;
+                    int row = popupButton.getRow() + 1;
+                    if (isCellVisible(row, column)) {
+                        registerPopupButton(popupButton);
+                    } else {
+                        unRegisterPopupButton(popupButton);
+                    }
                 }
             }
         }
@@ -3656,13 +3942,12 @@ public class Spreadsheet extends AbstractComponent implements HasComponents,
     }
 
     /**
-     * This event is fired when cell value changes.
+     * This is a parent class for a value change events.
      */
-    public static class CellValueChangeEvent extends Component.Event {
-
+    public abstract static class ValueChangeEvent extends Component.Event {
         private final Set<CellReference> changedCells;
 
-        public CellValueChangeEvent(Component source,
+        public ValueChangeEvent(Component source,
                 Set<CellReference> changedCells) {
             super(source);
             this.changedCells = changedCells;
@@ -3670,6 +3955,30 @@ public class Spreadsheet extends AbstractComponent implements HasComponents,
 
         public Set<CellReference> getChangedCells() {
             return changedCells;
+        }
+    }
+
+    /**
+     * This event is fired when cell value changes.
+     */
+    public static class CellValueChangeEvent extends ValueChangeEvent {
+
+        public CellValueChangeEvent(Component source,
+                Set<CellReference> changedCells) {
+            super(source, changedCells);
+        }
+
+    }
+
+    /**
+     * This event is fired when the value of a cell referenced by a formula cell
+     * changes making the formula value change
+     */
+    public static class FormulaValueChangeEvent extends ValueChangeEvent {
+
+        public FormulaValueChangeEvent(Component source,
+                Set<CellReference> changedCells) {
+            super(source, changedCells);
         }
     }
 
@@ -3834,6 +4143,24 @@ public class Spreadsheet extends AbstractComponent implements HasComponents,
     }
 
     /**
+     * Used for knowing when a cell referenced by a formula cell has changed in
+     * the Spreadsheet UI making the formula value change
+     */
+    public interface FormulaValueChangeListener extends Serializable {
+        public static final Method FORMULA_VALUE_CHANGE_METHOD = ReflectTools
+                .findMethod(FormulaValueChangeListener.class,
+                        "onFormulaValueChange", FormulaValueChangeEvent.class);
+
+        /**
+         * This is called when user changes the cell value in Spreadsheet.
+         * 
+         * @param event
+         *            FormulaValueChangeEvent that happened
+         */
+        public void onFormulaValueChange(FormulaValueChangeEvent event);
+    }
+
+    /**
      * Adds the given SelectionChangeListener to this Spreadsheet.
      * 
      * @param listener
@@ -3853,6 +4180,18 @@ public class Spreadsheet extends AbstractComponent implements HasComponents,
     public void addCellValueChangeListener(CellValueChangeListener listener) {
         addListener(CellValueChangeEvent.class, listener,
                 CellValueChangeListener.CELL_VALUE_CHANGE_METHOD);
+    }
+
+    /**
+     * Adds the given FormulaValueChangeListener to this Spreadsheet.
+     * 
+     * @param listener
+     *            Listener to add.
+     */
+    public void addFormulaValueChangeListener(
+            FormulaValueChangeListener listener) {
+        addListener(FormulaValueChangeEvent.class, listener,
+                FormulaValueChangeListener.FORMULA_VALUE_CHANGE_METHOD);
     }
 
     /**
@@ -4113,82 +4452,12 @@ public class Spreadsheet extends AbstractComponent implements HasComponents,
      * 
      * @see com.vaadin.ui.HasComponents#iterator()
      */
+    @SuppressWarnings("unchecked")
     @Override
     public Iterator<Component> iterator() {
-        if (customComponents == null && attachedPopupButtons.isEmpty()) {
-            List<Component> emptyList = Collections.emptyList();
-            return emptyList.iterator();
-        } else {
-            return new SpreadsheetIterator<Component>(customComponents,
-                    attachedPopupButtons);
-        }
-    }
-
-    /**
-     * Component iterator for components contained within the Spreadsheet:
-     * CustomComponents and PopupButtons.
-     */
-    private static class SpreadsheetIterator<E extends Component> implements
-            Iterator<Component> {
-        private final Iterator<Component> customComponentIterator;
-        private final Iterator<PopupButton> sheetPopupButtonIterator;
-        /** true for customComponentIterator, false for sheetPopupButtonIterator */
-        private boolean currentIteratorPointer;
-
-        public SpreadsheetIterator(Set<Component> customComponents,
-                Set<PopupButton> sheetPopupButtons) {
-            customComponentIterator = customComponents == null ? null
-                    : customComponents.iterator();
-            sheetPopupButtonIterator = sheetPopupButtons == null ? null
-                    : sheetPopupButtons.iterator();
-            currentIteratorPointer = true;
-        }
-
-        /*
-         * (non-Javadoc)
-         * 
-         * @see java.util.Iterator#hasNext()
-         */
-        @Override
-        public boolean hasNext() {
-            return (customComponentIterator != null && customComponentIterator
-                    .hasNext())
-                    || (sheetPopupButtonIterator != null && sheetPopupButtonIterator
-                            .hasNext());
-        }
-
-        /*
-         * (non-Javadoc)
-         * 
-         * @see java.util.Iterator#next()
-         */
-        @Override
-        public Component next() {
-            if (customComponentIterator != null
-                    && customComponentIterator.hasNext()) {
-                return customComponentIterator.next();
-            }
-            if (sheetPopupButtonIterator != null
-                    && sheetPopupButtonIterator.hasNext()) {
-                currentIteratorPointer = false;
-                return sheetPopupButtonIterator.next();
-            }
-            throw new NoSuchElementException();
-        }
-
-        /*
-         * (non-Javadoc)
-         * 
-         * @see java.util.Iterator#remove()
-         */
-        @Override
-        public void remove() {
-            if (currentIteratorPointer && customComponentIterator != null) {
-                customComponentIterator.remove();
-            } else if (sheetPopupButtonIterator != null) {
-                sheetPopupButtonIterator.remove();
-            }
-        }
+        return new IteratorChain<Component>(Arrays.asList(
+                customComponents.iterator(), attachedPopupButtons.iterator(),
+                overlayComponents.iterator()));
     }
 
     /**
@@ -4627,7 +4896,6 @@ public class Spreadsheet extends AbstractComponent implements HasComponents,
         super.focus();
     }
 
-
     /**
      * Controls if a column group is collapsed or not.
      * 
@@ -4656,7 +4924,13 @@ public class Spreadsheet extends AbstractComponent implements HasComponents,
                 GroupingUtil.expandRow(activeSheet, index);
             }
         }
-        SpreadsheetFactory.reloadSpreadsheetComponent(this, workbook);
+        SpreadsheetFactory.calculateSheetSizes(this, activeSheet);
+        SpreadsheetFactory.loadGrouping(this);
+        reloadActiveSheetStyles();
+        if (hasSheetOverlays()) {
+            reloadImageSizesFromPOI = true;
+            loadOrUpdateOverlays();
+        }
     }
 
     /**
@@ -4772,6 +5046,10 @@ public class Spreadsheet extends AbstractComponent implements HasComponents,
             invalidFormulas.get(activeSheetIndex).remove(
                     SpreadsheetUtil.toKey(col, row));
         }
+    }
+
+    public void addSheetOverlay(SheetOverlayWrapper image) {
+        sheetOverlays.add(image);
     }
 
 }

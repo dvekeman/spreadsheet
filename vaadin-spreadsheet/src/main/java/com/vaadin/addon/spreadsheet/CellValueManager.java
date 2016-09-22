@@ -46,6 +46,7 @@ import org.apache.poi.hssf.usermodel.HSSFCell;
 import org.apache.poi.hssf.usermodel.HSSFHyperlink;
 import org.apache.poi.hssf.usermodel.HSSFSheet;
 import org.apache.poi.ss.formula.FormulaParseException;
+import org.apache.poi.ss.formula.eval.ErrorEval;
 import org.apache.poi.ss.usermodel.Cell;
 import org.apache.poi.ss.usermodel.CellStyle;
 import org.apache.poi.ss.usermodel.DataFormatter;
@@ -59,8 +60,10 @@ import org.apache.poi.ss.util.CellReference;
 import org.apache.poi.xssf.usermodel.XSSFHyperlink;
 import org.apache.poi.xssf.usermodel.XSSFSheet;
 
+import com.vaadin.addon.spreadsheet.Spreadsheet.CellDeletionHandler;
 import com.vaadin.addon.spreadsheet.Spreadsheet.CellValueChangeEvent;
 import com.vaadin.addon.spreadsheet.Spreadsheet.CellValueHandler;
+import com.vaadin.addon.spreadsheet.Spreadsheet.FormulaValueChangeEvent;
 import com.vaadin.addon.spreadsheet.client.CellData;
 import com.vaadin.addon.spreadsheet.command.CellValueCommand;
 import com.vaadin.ui.UI;
@@ -90,6 +93,7 @@ public class CellValueManager implements Serializable {
     protected final Spreadsheet spreadsheet;
 
     private CellValueHandler customCellValueHandler;
+    private CellDeletionHandler customCellDeletionHandler;
 
     private DataFormatter formatter;
 
@@ -104,6 +108,8 @@ public class CellValueManager implements Serializable {
     private final HashSet<CellData> removedCells = new HashSet<CellData>();
     /** */
     private final HashSet<String> markedCells = new HashSet<String>();
+
+    private HashSet<CellReference> changedFormulaCells = new HashSet<CellReference>();
 
     private boolean topLeftCellsLoaded;
     private HashMap<Integer, Float> cellStyleWidthRatioMap;
@@ -176,6 +182,31 @@ public class CellValueManager implements Serializable {
         return spreadsheet.getFormulaEvaluator();
     }
 
+    private String getCachedFormulaCellValue(Cell formulaCell) {
+        String result = null;
+        switch (formulaCell.getCachedFormulaResultType()) {
+        case Cell.CELL_TYPE_STRING:
+            result = formulaCell.getStringCellValue();
+            break;
+        case Cell.CELL_TYPE_BOOLEAN:
+            result = String.valueOf(formulaCell
+                    .getBooleanCellValue());
+            break;
+        case Cell.CELL_TYPE_ERROR:
+            result = ErrorEval.getText(formulaCell
+                    .getErrorCellValue());
+            break;
+        case Cell.CELL_TYPE_NUMERIC:
+            CellStyle style = formulaCell.getCellStyle();
+            result = formatter.formatRawCellContents(
+                    formulaCell.getNumericCellValue(),
+                    style.getDataFormat(),
+                    style.getDataFormatString());
+            break;
+        }
+        return result;
+    }
+
     protected CellData createCellDataForCell(Cell cell) {
         CellData cellData = new CellData();
         cellData.row = cell.getRowIndex() + 1;
@@ -190,7 +221,12 @@ public class CellValueManager implements Serializable {
                             .reFormatFormulaValue(cell.getCellFormula(),
                                     spreadsheet.getLocale());
                     try {
-                        formatter.formatCellValue(cell, getFormulaEvaluator());
+                        String oldValue = getCachedFormulaCellValue(cell);
+                        String newValue = formatter.formatCellValue(cell,
+                                getFormulaEvaluator());
+                        if (!newValue.equals(oldValue)) {
+                            changedFormulaCells.add(new CellReference(cell));
+                        }
                     } catch (RuntimeException rte) {
                         // Apache POI throws RuntimeExceptions for an invalid
                         // formula from POI model
@@ -222,7 +258,11 @@ public class CellValueManager implements Serializable {
             if (spreadsheet
                     .isMarkedAsInvalidFormula(cellData.col, cellData.row)) {
                 // The prefix '=' or '+' should not be included in formula value
-                cellData.formulaValue = cell.getStringCellValue().substring(1);
+                if (cell.getStringCellValue().charAt(0) == '+'
+                        || cell.getStringCellValue().charAt(0) == '=') {
+                    cellData.formulaValue = cell.getStringCellValue()
+                            .substring(1);
+                }
                 formattedCellValue = "#VALUE!";
             }
 
@@ -382,6 +422,26 @@ public class CellValueManager implements Serializable {
     public void setCustomCellValueHandler(
             CellValueHandler customCellValueHandler) {
         this.customCellValueHandler = customCellValueHandler;
+    }
+
+    /**
+     * Gets the current CellDeletionHandler
+     *
+     * @return the customCellDeletionHandler
+     */
+    public CellDeletionHandler getCustomCellDeletionHandler() {
+        return customCellDeletionHandler;
+    }
+
+    /**
+     * Sets the current CellDeletionHandler
+     *
+     * @param customCellDeletionHandler
+     *            the customCellDeletionHandler to set
+     */
+    public void setCustomCellDeletionHandler(
+            CellDeletionHandler customCellDeletionHandler) {
+        this.customCellDeletionHandler = customCellDeletionHandler;
     }
 
     /**
@@ -658,6 +718,11 @@ public class CellValueManager implements Serializable {
         spreadsheet.fireEvent(new CellValueChangeEvent(spreadsheet, cells));
     }
 
+    private void fireFormulaValueChangeEvent(Set<CellReference> changedCells) {
+        spreadsheet.fireEvent(new FormulaValueChangeEvent(spreadsheet,
+                changedCells));
+    }
+
     private void fireCellValueChangeEvent(Set<CellReference> changedCells) {
         spreadsheet.fireEvent(new CellValueChangeEvent(spreadsheet,
                 changedCells));
@@ -668,7 +733,7 @@ public class CellValueManager implements Serializable {
      */
     public void onDeleteSelectedCells() {
         final Sheet activeSheet = spreadsheet.getActiveSheet();
-        final CellReference selectedCellReference = getCellSelectionManager()
+        CellReference selectedCellReference = getCellSelectionManager()
                 .getSelectedCellReference();
         // TODO show error on locked cells instead
         if (selectedCellReference != null) {
@@ -696,8 +761,44 @@ public class CellValueManager implements Serializable {
             }
         }
 
+        boolean selectedIsInRange = selectedIsInRange(selectedCellReference,
+                cellRangeAddresses);
+        boolean cellDeletionCheckPassed = !selectedIsInRange
+                && individualSelectedCells.isEmpty()
+                && passesDeletionCheck(selectedCellReference);
+        boolean individualCellsDeletionCheckPassed;
+        if (selectedCellReference == null) {
+            individualCellsDeletionCheckPassed = passesDeletionCheck(individualSelectedCells);
+        } else if (!selectedIsInRange && !individualSelectedCells.isEmpty()) {
+            List<CellReference> individualSelectedCellsIncludingCurrentSelection = new ArrayList<CellReference>(
+                    individualSelectedCells);
+            individualSelectedCellsIncludingCurrentSelection
+                    .add(selectedCellReference);
+            individualCellsDeletionCheckPassed = passesDeletionCheck(individualSelectedCellsIncludingCurrentSelection);
+            cellDeletionCheckPassed = individualCellsDeletionCheckPassed;
+        } else {
+            individualCellsDeletionCheckPassed = passesDeletionCheck(individualSelectedCells);
+        }
+        boolean cellRangeDeletionCheckPassed = passesRangeDeletionCheck(cellRangeAddresses);
+        // at least one of the selection types must pass the check and have
+        // contents
+        if ((selectedCellReference == null || !cellDeletionCheckPassed)
+                && (individualSelectedCells.isEmpty() || !individualCellsDeletionCheckPassed)
+                && (cellRangeAddresses.isEmpty() || !cellRangeDeletionCheckPassed)) {
+            return;
+        }
+        if (!cellDeletionCheckPassed) {
+            selectedCellReference = null;
+        }
+        if (!individualCellsDeletionCheckPassed) {
+            individualSelectedCells.clear();
+        }
+        if (!cellRangeDeletionCheckPassed) {
+            cellRangeAddresses.clear();
+        }
+
         CellValueCommand command = new CellValueCommand(spreadsheet);
-        if (selectedCellReference != null && selectedIsNotInTheRange(selectedCellReference, cellRangeAddresses)) {
+        if (selectedCellReference != null && !selectedIsInRange) {
             command.captureCellValues(selectedCellReference);
         }
         for (CellReference cr : individualSelectedCells) {
@@ -706,7 +807,7 @@ public class CellValueManager implements Serializable {
         for (CellRangeAddress range : cellRangeAddresses) {
             command.captureCellRangeValues(range);
         }
-        if (selectedCellReference != null) {
+        if (selectedCellReference != null && !selectedIsInRange) {
             removeCell(selectedCellReference.getRow() + 1,
                     selectedCellReference.getCol() + 1, false);
         }
@@ -725,13 +826,93 @@ public class CellValueManager implements Serializable {
         spreadsheet.loadHyperLinks();
     }
 
-    private boolean selectedIsNotInTheRange(CellReference selected, List<CellRangeAddress> cellRangeAddresses) {
+    /**
+     * Checks whether the given cell belongs to any given range.
+     * 
+     * @param cell
+     * @param cellRangeAddresses
+     * @return {@code true} if in range, {@code false} otherwise
+     */
+    private boolean selectedIsInRange(CellReference cell,
+            List<CellRangeAddress> cellRangeAddresses) {
         for (CellRangeAddress range : cellRangeAddresses) {
-            if(range.isInRange(selected.getRow(), selected.getCol())) {
-                return false;
+            if (range.isInRange(cell.getRow(), cell.getCol())) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Checks whether the default deletion handling should be performed for the
+     * selected cell or whether a custom deletion handler takes care of
+     * everything.
+     * 
+     * @param selectedCellReference
+     * @return {@code true} if the default handling should be performed,
+     *         {@code false} otherwise
+     */
+    private boolean passesDeletionCheck(CellReference selectedCellReference) {
+        if (selectedCellReference == null || customCellDeletionHandler == null) {
+            return true;
+        }
+        final Workbook workbook = spreadsheet.getWorkbook();
+        final Sheet activeSheet = workbook.getSheetAt(workbook
+                .getActiveSheetIndex());
+        int rowIndex = selectedCellReference.getRow();
+        final Row row = activeSheet.getRow(rowIndex);
+        if (row != null) {
+            short colIndex = selectedCellReference.getCol();
+            final Cell cell = row.getCell(colIndex);
+            if (cell != null) {
+                return customCellDeletionHandler.cellDeleted(cell, activeSheet,
+                        colIndex, rowIndex, getFormulaEvaluator(), formatter);
             }
         }
         return true;
+    }
+
+    /**
+     * Checks whether the default deletion handling should be performed for the
+     * individually selected cells or whether a custom deletion handler takes
+     * care of everything.
+     * 
+     * @param individualSelectedCells
+     * @return {@code true} if the default handling should be performed,
+     *         {@code false} otherwise
+     */
+    private boolean passesDeletionCheck(
+            List<CellReference> individualSelectedCells) {
+        if (individualSelectedCells.isEmpty()
+                || customCellDeletionHandler == null) {
+            return true;
+        }
+        final Workbook workbook = spreadsheet.getWorkbook();
+        final Sheet activeSheet = workbook.getSheetAt(workbook
+                .getActiveSheetIndex());
+        return customCellDeletionHandler.individualSelectedCellsDeleted(
+                individualSelectedCells, activeSheet, getFormulaEvaluator(),
+                formatter);
+    }
+
+    /**
+     * Checks whether the default deletion handling should be performed for the
+     * cell range or whether a custom deletion handler takes care of everything.
+     * 
+     * @param cellRangeAddresses
+     * @return {@code true} if the default handling should be performed,
+     *         {@code false} otherwise
+     */
+    private boolean passesRangeDeletionCheck(
+            List<CellRangeAddress> cellRangeAddresses) {
+        if (cellRangeAddresses.isEmpty() || customCellDeletionHandler == null) {
+            return true;
+        }
+        final Workbook workbook = spreadsheet.getWorkbook();
+        final Sheet activeSheet = workbook.getSheetAt(workbook
+                .getActiveSheetIndex());
+        return customCellDeletionHandler.cellRangeDeleted(cellRangeAddresses,
+                activeSheet, getFormulaEvaluator(), formatter);
     }
 
     /**
@@ -952,6 +1133,10 @@ public class CellValueManager implements Serializable {
                     updatedCellData.add(cd);
                 }
             }
+        }
+        if (!changedFormulaCells.isEmpty()) {
+            fireFormulaValueChangeEvent(changedFormulaCells);
+            changedFormulaCells = new HashSet<CellReference>();
         }
         // empty cells have cell data with just col and row
         updatedCellData.addAll(removedCells);

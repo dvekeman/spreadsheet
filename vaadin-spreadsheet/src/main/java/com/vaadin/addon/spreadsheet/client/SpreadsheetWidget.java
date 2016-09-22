@@ -32,6 +32,7 @@ import com.google.gwt.dom.client.Document;
 import com.google.gwt.dom.client.NativeEvent;
 import com.google.gwt.event.dom.client.KeyCodes;
 import com.google.gwt.event.dom.client.TouchEvent;
+import com.google.gwt.event.logical.shared.AttachEvent;
 import com.google.gwt.user.client.Event;
 import com.google.gwt.user.client.Timer;
 import com.google.gwt.user.client.ui.Composite;
@@ -83,6 +84,8 @@ public class SpreadsheetWidget extends Composite implements SheetHandler,
     }
 
     private static final int DELAYED_SERVER_REQUEST_DELAY = 200; // ms
+    private static final String DEFAULT_WIDTH = "500.0px";
+    private static final String DEFAULT_HEIGHT = "400.0px";
 
     private final SheetWidget sheetWidget;
     final FormulaBarWidget formulaBarWidget;
@@ -114,6 +117,11 @@ public class SpreadsheetWidget extends Composite implements SheetHandler,
     private int activeSheetIndex;
 
     private Map<Integer, String> cellStyleToCSSStyle;
+    public Map<Integer, Integer> rowIndexToStyleIndex;
+    public Map<Integer, Integer> columnIndexToStyleIndex;
+    private Set<Integer> lockedColumnIndexes;
+    private Set<Integer> lockedRowIndexes;
+
     private Map<Integer, String> conditionalFormattingStyles = new HashMap<Integer, String>();
 
     private boolean loaded;
@@ -196,6 +204,45 @@ public class SpreadsheetWidget extends Composite implements SheetHandler,
         sheetWidget.getElement().appendChild(sheetTabSheet.getElement());
 
         initWidget(sheetWidget);
+
+        //There is a bug in CssLayout/VerticalLayout.
+        //If a component calls setVisible(false) another component in the layout
+        //next to it is detached and then attached to the layout and the scroll
+        //position is reset. We need to store the scroll position on detach and
+        //then set on attach event.
+        sheetWidget.addAttachHandler(new AttachEvent.Handler() {
+            int leftScrollPosition = 0;
+            int topScrollPosition = 0;
+
+            @Override
+            public void onAttachOrDetach(AttachEvent attachEvent) {
+                if (attachEvent.isAttached()) {
+                    sheetWidget.setScrollPosition(leftScrollPosition, topScrollPosition);
+                } else {
+                    leftScrollPosition = sheetWidget.getSheetScrollLeft();
+                    topScrollPosition = sheetWidget.getSheetScrollTop();
+                }
+
+            }
+        });
+    }
+
+    @Override
+    public void setHeight(final String height) {
+        if (height != null && !height.isEmpty()) {
+            super.setHeight(height);
+        } else {
+            super.setHeight(DEFAULT_HEIGHT);
+        }
+    }
+
+    @Override
+    public void setWidth(final String width) {
+        if (width != null && !width.isEmpty()) {
+            super.setWidth(width);
+        } else {
+            super.setWidth(DEFAULT_WIDTH);
+        }
     }
 
     /**
@@ -426,25 +473,20 @@ public class SpreadsheetWidget extends Composite implements SheetHandler,
         sheetWidget.setCellCommentVisible(false, key);
     }
 
-    public void addImage(String key, String resourceURL, ImageInfo imageInfo) {
-        SheetImage image = new SheetImage(resourceURL);
-        updateSheetImageInfo(image, imageInfo);
-        sheetWidget.addSheetImage(key, image);
+    /**
+     * Handles overlays, currently images and charts.
+     */
+    void addOverlay(String key, Widget widget, OverlayInfo overlayInfo) {
+        SheetOverlay overlay = new SheetOverlay(widget, overlayInfo);
+        sheetWidget.addSheetOverlay(key, overlay);
     }
 
-    public void updateImage(String key, ImageInfo imageInfo) {
-        updateSheetImageInfo(sheetWidget.getSheetImage(key), imageInfo);
+    void updateOverlay(String key, OverlayInfo overlayInfo) {
+        sheetWidget.updateOverlayInfo(key, overlayInfo);
     }
 
-    private void updateSheetImageInfo(SheetImage image, ImageInfo imageInfo) {
-        image.setLocation(imageInfo.col, imageInfo.row);
-        image.setHeight(imageInfo.height);
-        image.setWidth(imageInfo.width);
-        image.setPadding(imageInfo.dx, imageInfo.dy);
-    }
-
-    public void removeImage(String key) {
-        sheetWidget.removeSheetImage(key);
+    void removeOverlay(String key) {
+        sheetWidget.removeSheetOverlay(key);
     }
 
     public void updateMergedRegions(final ArrayList<MergedRegion> mergedRegions) {
@@ -461,6 +503,7 @@ public class SpreadsheetWidget extends Composite implements SheetHandler,
                         sheetWidget.addMergedRegion(newMergedRegion);
                         i++;
                     }
+                    sheetWidget.checkMergedRegionPositions();
                 }
 
                 // copy list for later
@@ -1545,6 +1588,52 @@ public class SpreadsheetWidget extends Composite implements SheetHandler,
         }
     }
 
+    public void setRowIndexToStyleIndex(
+            HashMap<Integer, Integer> rowIndexToStyleIndex) {
+        if (this.rowIndexToStyleIndex == null) {
+            this.rowIndexToStyleIndex = rowIndexToStyleIndex;
+        } else {
+            this.rowIndexToStyleIndex.clear();
+            if (rowIndexToStyleIndex != null) {
+                this.rowIndexToStyleIndex.putAll(rowIndexToStyleIndex);
+            }
+        }
+    }
+
+    public void setColumnIndexToStyleIndex(
+            HashMap<Integer, Integer> columnIndexToStyleIndex) {
+        if (this.columnIndexToStyleIndex == null) {
+            this.columnIndexToStyleIndex = columnIndexToStyleIndex;
+        } else {
+            this.columnIndexToStyleIndex.clear();
+            if (columnIndexToStyleIndex != null) {
+                this.columnIndexToStyleIndex.putAll(columnIndexToStyleIndex);
+            }
+        }
+    }
+
+    public void setLockedColumnIndexes(Set<Integer> lockedColumnIndexes) {
+        if (this.lockedColumnIndexes == null) {
+            this.lockedColumnIndexes = lockedColumnIndexes;
+        } else {
+            this.lockedColumnIndexes.clear();
+            if (lockedColumnIndexes != null) {
+                this.lockedColumnIndexes.addAll(lockedColumnIndexes);
+            }
+        }
+    }
+
+    public void setLockedRowIndexes(Set<Integer> lockedRowIndexes) {
+        if (this.lockedRowIndexes == null) {
+            this.lockedRowIndexes = lockedRowIndexes;
+        } else {
+            this.lockedRowIndexes.clear();
+            if (lockedRowIndexes != null) {
+                this.lockedRowIndexes.addAll(lockedRowIndexes);
+            }
+        }
+    }
+
     public void setShiftedCellBorderStyles(
             ArrayList<String> shiftedCellBorderStyles) {
         sheetWidget.removeShiftedCellBorderStyles();
@@ -1591,6 +1680,16 @@ public class SpreadsheetWidget extends Composite implements SheetHandler,
         return sheetProtected;
     }
 
+    @Override
+    public boolean isColProtected(int col) {
+        return lockedColumnIndexes.contains(col);
+    }
+
+    @Override
+    public boolean isRowProtected(int row) {
+        return lockedRowIndexes.contains(row);
+    }
+
     public void setWorkbookProtected(boolean workbookProtected) {
         sheetTabSheet.setReadOnly(workbookProtected);
     }
@@ -1619,6 +1718,16 @@ public class SpreadsheetWidget extends Composite implements SheetHandler,
     @Override
     public Map<Integer, String> getCellStyleToCSSStyle() {
         return cellStyleToCSSStyle;
+    }
+
+    @Override
+    public Map<Integer, Integer> getRowIndexToStyleIndex() {
+        return rowIndexToStyleIndex;
+    }
+
+    @Override
+    public Map<Integer, Integer> getColumnIndexToStyleIndex() {
+        return columnIndexToStyleIndex;
     }
 
     @Override

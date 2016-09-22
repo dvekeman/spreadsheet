@@ -128,6 +128,10 @@ public interface SheetHandler extends GroupingHandler {
 
     Map<Integer, String> getCellStyleToCSSStyle();
 
+    Map<Integer, Integer> getRowIndexToStyleIndex();
+
+    Map<Integer, Integer> getColumnIndexToStyleIndex();
+
     Map<Integer, String> getConditionalFormattingStyles();
 
     /**
@@ -241,4 +245,9 @@ public interface SheetHandler extends GroupingHandler {
     void selectAll();
 
     boolean isSheetProtected();
+
+    boolean isColProtected(int col);
+
+    boolean isRowProtected(int row);
+
 }

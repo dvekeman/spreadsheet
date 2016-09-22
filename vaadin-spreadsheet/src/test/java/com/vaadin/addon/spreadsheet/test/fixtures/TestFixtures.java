@@ -9,9 +9,12 @@ public enum TestFixtures {
             PopupButtonFixture.class), TabsheetPopupButton(
             TabsheetPopupButtonFixture.class), TablePopupButton(
             TablePopupButtonFixture.class), SpreadsheetTable(
-            SpreadsheetTableFixture.class), Comments(CommentFixture.class),
-            AddOrRemoveComment(AddOrRemoveCommentFixture.class),
-            Formats(FormatsFixture.class);
+            SpreadsheetTableFixture.class), Comments(CommentFixture.class), AddOrRemoveComment(
+            AddOrRemoveCommentFixture.class), Formats(FormatsFixture.class), DisableChartOverlays(
+            DisableChartsFixture.class), StyleMergeReigions(
+            StyleMergeReigions.class), RemoveFixture(RemoveFixture.class), DefaultStyleUnlocked(
+            DefaultStyleUnlockedFixture.class), HideSecondRow(
+            HideSecondRowFixture.class);
 
     public final SpreadsheetFixtureFactory factory;
 
